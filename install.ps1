@@ -57,6 +57,7 @@ $gitCmdDir = Split-Path -Parent (Get-Command 'git').Source
 # Ensure POSIX coreutils (/usr/bin) and git are available on PATH for usr\bin\sh.exe
 $extraPaths = @($shDir, $gitCmdDir, $gitExecDir) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
 $oldPath = $env:PATH
+$tmpScript = $null
 try {
     $env:PATH = (($extraPaths -join ';') + ';' + $oldPath)
 
@@ -70,13 +71,15 @@ try {
     if (-not $scriptPath -and (Test-Path -LiteralPath '.\git-worktreeinclude')) {
         $scriptPath = (Resolve-Path -LiteralPath '.\git-worktreeinclude').Path
     }
-    if (-not $scriptPath -and $env:GIT_WORKTREEINCLUDE_RAW_URL) {
-        $tmpScript = Join-Path ([System.IO.Path]::GetTempPath()) "git-worktreeinclude-$PID"
-        Invoke-WebRequest -UseBasicParsing -Uri $env:GIT_WORKTREEINCLUDE_RAW_URL -OutFile $tmpScript
-        $scriptPath = $tmpScript
-    }
     if (-not $scriptPath) {
-        throw "Could not find 'git-worktreeinclude' next to install.ps1 or in the current directory."
+        $rawUrl = if ($env:GIT_WORKTREEINCLUDE_RAW_URL) {
+            $env:GIT_WORKTREEINCLUDE_RAW_URL
+        } else {
+            'https://raw.githubusercontent.com/martinskuta/git-worktreeinclude-hook/main/git-worktreeinclude'
+        }
+        $tmpScript = Join-Path ([System.IO.Path]::GetTempPath()) "git-worktreeinclude-$PID"
+        Invoke-WebRequest -UseBasicParsing -Uri $rawUrl -OutFile $tmpScript
+        $scriptPath = $tmpScript
     }
 
     $effectiveArgs = @()
@@ -89,7 +92,15 @@ try {
     }
 
     & $shExe $scriptPath @effectiveArgs
-    exit $LASTEXITCODE
+    $code = $LASTEXITCODE
+    if ($MyInvocation.MyCommand.Path) {
+        exit $code
+    } elseif ($code -ne 0) {
+        throw "git-worktreeinclude failed with exit code $code"
+    }
 } finally {
     $env:PATH = $oldPath
+    if ($tmpScript -and (Test-Path -LiteralPath $tmpScript)) {
+        Remove-Item -LiteralPath $tmpScript -Force -ErrorAction SilentlyContinue
+    }
 }

@@ -28,22 +28,54 @@ Zero runtime dependencies: implemented as a single self-contained POSIX `sh` scr
 **macOS / Linux / WSL / Git Bash:**
 
 ```sh
-sh git-worktreeinclude install
-```
-
-*(Or directly via `curl` once hosted:)*
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/<owner>/git-worktreeinclude-hook/main/git-worktreeinclude -o /tmp/git-worktreeinclude && sh /tmp/git-worktreeinclude install
+curl -fsSL https://raw.githubusercontent.com/martinskuta/git-worktreeinclude-hook/main/git-worktreeinclude | sh -s -- install
 ```
 
 **Windows PowerShell:**
 
 ```powershell
+irm https://raw.githubusercontent.com/martinskuta/git-worktreeinclude-hook/main/install.ps1 | iex
+```
+
+Installing registers the `git worktreeinclude` Git subcommand, so `git worktreeinclude ...` works everywhere (`zsh`, `bash`, `fish`, `Git Bash`, `PowerShell`, `cmd.exe`) with **no `PATH` changes required**.
+
+### Install from a Cloned Repository
+
+**macOS / Linux / WSL / Git Bash:**
+
+```sh
+git clone https://github.com/martinskuta/git-worktreeinclude-hook.git
+cd git-worktreeinclude-hook
+sh git-worktreeinclude install
+```
+
+**Windows PowerShell:**
+
+```powershell
+git clone https://github.com/martinskuta/git-worktreeinclude-hook.git
+cd git-worktreeinclude-hook
 .\install.ps1
 ```
 
-Installing registers the `git worktreeinclude` Git subcommand, so `git worktreeinclude ...` works everywhere (`zsh`, `bash`, `fish`, `PowerShell`, `cmd.exe`) with **no `PATH` changes required**.
+### Per-Repository Install (`--local`)
+
+If you already ran the global install above, enable a specific repository locally (for example, a repo with its own `.husky` `core.hooksPath`) with:
+
+```sh
+git worktreeinclude install --local
+```
+
+Or install `--local` directly from GitHub without global setup:
+
+```sh
+# macOS / Linux / WSL / Git Bash (run inside the target repository)
+curl -fsSL https://raw.githubusercontent.com/martinskuta/git-worktreeinclude-hook/main/git-worktreeinclude | sh -s -- install --local
+```
+
+```powershell
+# Windows PowerShell (run inside the target repository)
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/martinskuta/git-worktreeinclude-hook/main/install.ps1))) --local
+```
 
 ### Uninstall (1 command)
 
@@ -54,7 +86,6 @@ git worktreeinclude uninstall
 *(For per-repository installations:)*
 
 ```sh
-sh git-worktreeinclude install --local
 git worktreeinclude uninstall --local
 ```
 

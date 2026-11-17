@@ -6,6 +6,7 @@
 set -u
 
 WTI_VERSION="1.0.0"
+WTI_DEFAULT_RAW_URL="https://raw.githubusercontent.com/martinskuta/git-worktreeinclude-hook/main/git-worktreeinclude"
 WTI_BLOCK_BEGIN="# >>> git-worktreeinclude >>>"
 WTI_BLOCK_END="# <<< git-worktreeinclude <<<"
 WTI_PASSTHROUGH_MARKER="# git-worktreeinclude-managed-passthrough"
@@ -98,12 +99,32 @@ is_zero_oid() {
 }
 
 resolve_self_source() {
-    for cand in "$0" "./git-worktreeinclude" "$(get_global_data_dir)/git-worktreeinclude"; do
+    for cand in "$0" "./git-worktreeinclude"; do
         if [ -n "$cand" ] && [ -f "$cand" ] && grep -q "GIT_WORKTREEINCLUDE_MARKER=1" "$cand" 2>/dev/null; then
             printf '%s\n' "$cand"
             return 0
         fi
     done
+
+    if ensure_tmp; then
+        dl_url="${GIT_WORKTREEINCLUDE_RAW_URL:-$WTI_DEFAULT_RAW_URL}"
+        dl_dst="$WTI_TMP/git-worktreeinclude.src"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL "$dl_url" > "$dl_dst" 2>/dev/null || rm -f "$dl_dst" 2>/dev/null || true
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$dl_dst" "$dl_url" 2>/dev/null || rm -f "$dl_dst" 2>/dev/null || true
+        fi
+        if [ -f "$dl_dst" ] && grep -q "GIT_WORKTREEINCLUDE_MARKER=1" "$dl_dst" 2>/dev/null; then
+            printf '%s\n' "$dl_dst"
+            return 0
+        fi
+    fi
+
+    cand="$(get_global_data_dir)/git-worktreeinclude"
+    if [ -n "$cand" ] && [ -f "$cand" ] && grep -q "GIT_WORKTREEINCLUDE_MARKER=1" "$cand" 2>/dev/null; then
+        printf '%s\n' "$cand"
+        return 0
+    fi
     return 1
 }
 
@@ -1222,6 +1243,7 @@ cmd_install() {
         esac
     done
 
+    ensure_tmp || { log_err "failed to create temporary directory"; exit 1; }
     self_src=$(resolve_self_source || true)
     if [ -z "$self_src" ]; then
         log_err "cannot locate git-worktreeinclude script source; run 'sh ./git-worktreeinclude install' from the downloaded script"
