@@ -1,0 +1,1769 @@
+#!/bin/sh
+# git-worktreeinclude — Automatically populate new Git worktrees from .worktreeinclude
+# GIT_WORKTREEINCLUDE_MARKER=1
+# License: MIT
+
+set -u
+
+WTI_VERSION="1.0.0"
+WTI_BLOCK_BEGIN="# >>> git-worktreeinclude >>>"
+WTI_BLOCK_END="# <<< git-worktreeinclude <<<"
+WTI_PASSTHROUGH_MARKER="# git-worktreeinclude-managed-passthrough"
+WTI_WRAPPER_MARKER="# git-worktreeinclude-managed-wrapper"
+
+WTI_STANDARD_HOOKS="applypatch-msg pre-applypatch post-applypatch pre-commit pre-merge-commit prepare-commit-msg commit-msg post-commit pre-rebase post-checkout post-merge pre-push pre-receive update proc-receive post-receive post-update reference-transaction push-to-checkout pre-auto-gc post-rewrite sendemail-validate fsmonitor-watchman p4-changelist p4-prepare-changelist p4-post-changelist p4-pre-submit post-index-change"
+
+WTI_TMP=""
+WTI_CP_MODE=""
+WTI_COPIED_COUNT=0
+WTI_ERROR_COUNT=0
+WTI_VERBOSE="${GIT_WORKTREEINCLUDE_VERBOSE:-0}"
+case "$WTI_VERBOSE" in
+    1|true|TRUE|yes|YES) WTI_VERBOSE=1 ;;
+    *) WTI_VERBOSE=0 ;;
+esac
+
+cleanup_tmp() {
+    if [ -n "$WTI_TMP" ] && [ -d "$WTI_TMP" ]; then
+        rm -rf "$WTI_TMP" 2>/dev/null || true
+    fi
+}
+
+ensure_tmp() {
+    if [ -n "$WTI_TMP" ] && [ -d "$WTI_TMP" ]; then
+        return 0
+    fi
+    wti_base="${TMPDIR:-/tmp}"
+    wti_base="${wti_base%/}"
+    WTI_TMP=$(mktemp -d "$wti_base/git-wti.XXXXXX" 2>/dev/null || true)
+    if [ -z "$WTI_TMP" ] || [ ! -d "$WTI_TMP" ]; then
+        WTI_TMP="$wti_base/git-wti.$$.$(date +%s 2>/dev/null || printf '0')"
+        mkdir -p "$WTI_TMP" || return 1
+    fi
+    trap 'cleanup_tmp' EXIT INT TERM HUP
+}
+
+log_info() {
+    printf 'worktreeinclude: %s\n' "$*" >&2
+}
+
+log_verbose() {
+    if [ "$WTI_VERBOSE" = "1" ]; then
+        printf 'worktreeinclude: %s\n' "$*" >&2
+    fi
+}
+
+log_warn() {
+    printf 'worktreeinclude: warning: %s\n' "$*" >&2
+}
+
+log_err() {
+    printf 'worktreeinclude: error: %s\n' "$*" >&2
+}
+
+canon_dir() {
+    (cd "$1" 2>/dev/null && pwd -P)
+}
+
+native_git_path() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -m "$1"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+sh_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+get_global_data_dir() {
+    if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+        printf '%s/git/worktreeinclude\n' "${XDG_CONFIG_HOME%/}"
+    else
+        printf '%s/.config/git/worktreeinclude\n' "${HOME%/}"
+    fi
+}
+
+is_zero_oid() {
+    case "${1:-}" in
+        0000000000000000000000000000000000000000*)
+            case "$1" in
+                *[!0]*) return 1 ;;
+                *) return 0 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_self_source() {
+    for cand in "$0" "./git-worktreeinclude" "$(get_global_data_dir)/git-worktreeinclude"; do
+        if [ -n "$cand" ] && [ -f "$cand" ] && grep -q "GIT_WORKTREEINCLUDE_MARKER=1" "$cand" 2>/dev/null; then
+            printf '%s\n' "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+copy_script_clean() {
+    src_script="$1"
+    dst_script="$2"
+    dst_parent=$(dirname "$dst_script")
+    mkdir -p "$dst_parent" || return 1
+    tmp_dst="$dst_script.tmp.$$"
+    if ! tr -d '\r' < "$src_script" > "$tmp_dst"; then
+        rm -f "$tmp_dst" 2>/dev/null || true
+        return 1
+    fi
+    chmod +x "$tmp_dst" 2>/dev/null || true
+    if ! mv -f "$tmp_dst" "$dst_script"; then
+        rm -f "$tmp_dst" 2>/dev/null || true
+        return 1
+    fi
+    chmod +x "$dst_script" 2>/dev/null || true
+    return 0
+}
+
+# Resolve primary worktree from git worktree list --porcelain:
+# - Standard repos: strictly the first entry (original primary worktree).
+# - Bare repos (first entry has 'bare'): prefer the worktree on the bare repo's HEAD branch
+#   or containing .worktreeinclude, falling back to the first non-bare worktree.
+resolve_primary_worktree() {
+    repo_ctx="${1:-.}"
+    exclude_wt="${2:-}"
+    ensure_tmp || return 1
+    wt_porcelain="$WTI_TMP/worktrees.$$"
+    if ! git -C "$repo_ctx" -c core.quotePath=false worktree list --porcelain > "$wt_porcelain" 2>/dev/null; then
+        return 1
+    fi
+    printf '\n' >> "$wt_porcelain"
+
+    stanza_idx=0
+    first_is_bare=0
+    bare_default_ref=""
+    cur_wt=""
+    cur_bare=0
+    cur_branch=""
+
+    first_nonbare=""
+    head_branch_wt=""
+    wti_bearing_wt=""
+
+    while IFS= read -r line; do
+        line_cr="${line%$(printf '\r')}"
+        if [ -z "$line_cr" ]; then
+            if [ -n "$cur_wt" ]; then
+                stanza_idx=$((stanza_idx + 1))
+                if [ "$stanza_idx" = "1" ]; then
+                    if [ "$cur_bare" = "1" ]; then
+                        first_is_bare=1
+                        bare_default_ref=$(git -C "$cur_wt" symbolic-ref -q HEAD 2>/dev/null || true)
+                    elif [ -d "$cur_wt" ]; then
+                        found_wt=$(canon_dir "$cur_wt")
+                        if [ -n "$found_wt" ]; then
+                            printf '%s\n' "$found_wt"
+                            return 0
+                        fi
+                    fi
+                elif [ "$cur_bare" = "0" ] && [ -d "$cur_wt" ]; then
+                    c_wt=$(canon_dir "$cur_wt" || true)
+                    if [ -n "$c_wt" ] && [ "$c_wt" != "$exclude_wt" ]; then
+                        [ -z "$first_nonbare" ] && first_nonbare="$c_wt"
+                        if [ -n "$bare_default_ref" ] && [ "$cur_branch" = "$bare_default_ref" ] && [ -z "$head_branch_wt" ]; then
+                            head_branch_wt="$c_wt"
+                        fi
+                        if [ -z "$wti_bearing_wt" ] && [ -f "$c_wt/.worktreeinclude" ]; then
+                            wti_bearing_wt="$c_wt"
+                        fi
+                    fi
+                fi
+            fi
+            cur_wt=""
+            cur_bare=0
+            cur_branch=""
+        else
+            case "$line_cr" in
+                "worktree "*) cur_wt="${line_cr#worktree }" ;;
+                "bare") cur_bare=1 ;;
+                "branch "*) cur_branch="${line_cr#branch }" ;;
+            esac
+        fi
+    done < "$wt_porcelain"
+
+    if [ "$first_is_bare" = "1" ]; then
+        if [ -n "$head_branch_wt" ] && [ -f "$head_branch_wt/.worktreeinclude" ]; then
+            printf '%s\n' "$head_branch_wt"
+            return 0
+        fi
+        if [ -n "$wti_bearing_wt" ]; then
+            printf '%s\n' "$wti_bearing_wt"
+            return 0
+        fi
+        if [ -n "$head_branch_wt" ]; then
+            printf '%s\n' "$head_branch_wt"
+            return 0
+        fi
+    fi
+
+    if [ -n "$first_nonbare" ]; then
+        printf '%s\n' "$first_nonbare"
+        return 0
+    fi
+    return 1
+}
+
+# List all non-bare worktrees (canonical paths, one per line)
+list_all_nonbare_worktrees() {
+    repo_ctx="${1:-.}"
+    ensure_tmp || return 1
+    wt_porcelain="$WTI_TMP/worktrees_all.$$"
+    git -C "$repo_ctx" -c core.quotePath=false worktree list --porcelain > "$wt_porcelain" 2>/dev/null || return 1
+    printf '\n' >> "$wt_porcelain"
+
+    cur_wt=""
+    cur_bare=0
+    while IFS= read -r line; do
+        line_cr="${line%$(printf '\r')}"
+        if [ -z "$line_cr" ]; then
+            if [ -n "$cur_wt" ] && [ "$cur_bare" = "0" ] && [ -d "$cur_wt" ]; then
+                c_wt=$(canon_dir "$cur_wt" || true)
+                if [ -n "$c_wt" ]; then
+                    printf '%s\n' "$c_wt"
+                fi
+            fi
+            cur_wt=""
+            cur_bare=0
+        else
+            case "$line_cr" in
+                "worktree "*) cur_wt="${line_cr#worktree }" ;;
+                "bare") cur_bare=1 ;;
+            esac
+        fi
+    done < "$wt_porcelain"
+}
+
+# Check whether a relative subdirectory inside main_wt is inside a Git-ignored directory or nested Git repo
+is_subdir_eligible() {
+    main_wt="$1"
+    rel_sub="$2"
+    anc=""
+    old_ifs="$IFS"
+    IFS="/"
+    set -- $rel_sub
+    IFS="$old_ifs"
+    for seg in "$@"; do
+        [ -z "$seg" ] && continue
+        if [ -z "$anc" ]; then
+            anc="$seg"
+        else
+            anc="$anc/$seg"
+        fi
+        # Skip embedded nested git repositories
+        if [ -e "$main_wt/$anc/.git" ] || [ -L "$main_wt/$anc/.git" ]; then
+            return 1
+        fi
+        # If directory contains tracked files, it is part of the active repo even if matching .gitignore
+        tracked_probe=$(git -C "$main_wt" -c core.quotePath=false ls-files -- "$anc/" 2>/dev/null | sed -n '1p')
+        if [ -z "$tracked_probe" ]; then
+            if git -C "$main_wt" check-ignore -q -- "$anc" 2>/dev/null; then
+                return 1
+            fi
+        fi
+    done
+    return 0
+}
+
+# Discover .worktreeinclude files in root and non-Git-ignored subdirectories, sorted shallowest-first
+discover_worktreeinclude_files() {
+    main_wt="$1"
+    out_file="$2"
+    raw_cands="$WTI_TMP/wti_raw_cands"
+    dedup_cands="$WTI_TMP/wti_dedup_cands"
+    valid_cands="$WTI_TMP/wti_valid_cands"
+    : > "$raw_cands"
+    : > "$valid_cands"
+
+    if [ -f "$main_wt/.worktreeinclude" ] && [ ! -d "$main_wt/.worktreeinclude" ]; then
+        printf '.worktreeinclude\n' >> "$raw_cands"
+    fi
+
+    git -C "$main_wt" -c core.quotePath=false ls-files -c -o --exclude-standard 2>/dev/null | awk '
+        {
+            sub(/\r$/, "")
+            if ($0 == ".worktreeinclude" || (length($0) > 17 && substr($0, length($0) - 16) == "/.worktreeinclude")) {
+                print $0
+            }
+        }
+    ' >> "$raw_cands"
+
+    git -C "$main_wt" -c core.quotePath=false ls-files -o -i --exclude-standard --directory 2>/dev/null | awk '
+        {
+            sub(/\r$/, "")
+            if ($0 == ".worktreeinclude" || (length($0) > 17 && substr($0, length($0) - 16) == "/.worktreeinclude")) {
+                print $0
+            }
+        }
+    ' >> "$raw_cands"
+
+    LC_ALL=C sort -u "$raw_cands" > "$dedup_cands"
+
+    while IFS= read -r rel_wti; do
+        [ -z "$rel_wti" ] && continue
+        [ -f "$main_wt/$rel_wti" ] || continue
+        [ ! -d "$main_wt/$rel_wti" ] || continue
+        if [ "$rel_wti" = ".worktreeinclude" ]; then
+            printf '0\t.worktreeinclude\n' >> "$valid_cands"
+        else
+            sub_dir="${rel_wti%/.worktreeinclude}"
+            if is_subdir_eligible "$main_wt" "$sub_dir"; then
+                depth=$(printf '%s' "$rel_wti" | awk -F'/' '{ print NF - 1 }')
+                printf '%s\t%s\n' "$depth" "$rel_wti" >> "$valid_cands"
+            fi
+        fi
+    done < "$dedup_cands"
+
+    LC_ALL=C sort -n -k1,1 -k2,2 "$valid_cands" | cut -f2- > "$out_file"
+}
+
+# Scope rules from a single .worktreeinclude file to root exclude syntax
+scope_single_wti_file() {
+    subdir="$1"
+    file="$2"
+    if [ -z "$subdir" ] || [ "$subdir" = "." ]; then
+        tr -d '\r' < "$file"
+        printf '\n'
+        return 0
+    fi
+    awk -v dir="$subdir" '
+    function escape_dir(s,    out, i, c) {
+        out = ""
+        for (i = 1; i <= length(s); i++) {
+            c = substr(s, i, 1)
+            if (c == "\\" || c == "*" || c == "?" || c == "[") {
+                out = out "\\" c
+            } else {
+                out = out c
+            }
+        }
+        return out
+    }
+    BEGIN {
+        esc_dir = escape_dir(dir)
+    }
+    {
+        sub(/\r$/, "")
+        line = $0
+        if (line == "" || substr(line, 1, 1) == "#") next
+
+        while (length(line) > 0 && substr(line, length(line), 1) == " ") {
+            bs = 0
+            j = length(line) - 1
+            while (j >= 1 && substr(line, j, 1) == "\\") {
+                bs++
+                j--
+            }
+            if (bs % 2 == 1) break
+            line = substr(line, 1, length(line) - 1)
+        }
+        if (line == "") next
+
+        neg = ""
+        if (substr(line, 1, 1) == "!") {
+            neg = "!"
+            line = substr(line, 2)
+        } else if (substr(line, 1, 2) == "\\!" || substr(line, 1, 2) == "\\#") {
+            line = substr(line, 2)
+        }
+        if (line == "") next
+
+        trailing_slash = ""
+        core = line
+        if (substr(core, length(core), 1) == "/") {
+            trailing_slash = "/"
+            core = substr(core, 1, length(core) - 1)
+        }
+        if (core == "") next
+
+        if (index(core, "/") > 0) {
+            if (substr(core, 1, 1) == "/") {
+                core = substr(core, 2)
+            }
+            if (core == "") {
+                print neg "/" esc_dir "/"
+            } else {
+                print neg "/" esc_dir "/" core trailing_slash
+            }
+        } else if (core == "**") {
+            print neg "/" esc_dir "/**" trailing_slash
+        } else {
+            print neg "/" esc_dir "/**/" core trailing_slash
+        }
+    }
+    ' "$file"
+}
+
+# Evaluate .worktreeinclude files in main_wt and produce matched candidate entries (dirs end with /)
+collect_matched_candidates() {
+    main_wt="$1"
+    wti_list_file="$2"
+    candidates_out="$3"
+    compiled_rules="$WTI_TMP/compiled_rules"
+    : > "$compiled_rules"
+
+    while IFS= read -r rel_wti; do
+        [ -z "$rel_wti" ] && continue
+        if [ "$rel_wti" = ".worktreeinclude" ]; then
+            scope_single_wti_file "" "$main_wt/$rel_wti" >> "$compiled_rules"
+        else
+            scope_single_wti_file "${rel_wti%/.worktreeinclude}" "$main_wt/$rel_wti" >> "$compiled_rules"
+        fi
+    done < "$wti_list_file"
+
+    # Run Git native exclude matcher on untracked paths; drop synthetic parent dirs whose leaf children follow
+    git -C "$main_wt" -c core.quotePath=false ls-files -o -i --exclude-from="$compiled_rules" --directory 2>/dev/null | awk '
+        {
+            sub(/\r$/, "")
+            curr = $0
+            if (curr == "") next
+            if (prev != "") {
+                if (substr(prev, length(prev), 1) == "/" && substr(curr, 1, length(prev)) == prev) {
+                    # Synthetic directory entry emitted only because all leaf children matched; drop it
+                } else {
+                    print prev
+                }
+            }
+            prev = curr
+        }
+        END {
+            if (prev != "") {
+                print prev
+            }
+        }
+    ' > "$candidates_out"
+}
+
+probe_cow_mode() {
+    if [ -n "$WTI_CP_MODE" ]; then
+        return 0
+    fi
+    ensure_tmp || { WTI_CP_MODE="posix"; return 0; }
+    p_src="$WTI_TMP/cow_src"
+    p_dst="$WTI_TMP/cow_dst"
+    printf 'x' > "$p_src"
+    rm -f "$p_dst" 2>/dev/null || true
+    if cp --reflink=auto -P -p "$p_src" "$p_dst" 2>/dev/null; then
+        WTI_CP_MODE="gnu_reflink"
+    else
+        rm -f "$p_dst" 2>/dev/null || true
+        if cp -c -P -p "$p_src" "$p_dst" 2>/dev/null; then
+            WTI_CP_MODE="bsd_clone"
+        else
+            WTI_CP_MODE="posix"
+        fi
+    fi
+    rm -f "$p_src" "$p_dst" 2>/dev/null || true
+}
+
+# Verify no existing regular file or symlink blocks directory creation along target ancestor path
+ensure_safe_parent_dir() {
+    target_root="$1"
+    rel_path="$2"
+    case "$rel_path" in
+        */*) rel_parent="${rel_path%/*}" ;;
+        *) return 0 ;;
+    esac
+
+    cur_check="$target_root"
+    old_ifs="$IFS"
+    IFS="/"
+    set -- $rel_parent
+    IFS="$old_ifs"
+    for seg in "$@"; do
+        [ -z "$seg" ] && continue
+        cur_check="$cur_check/$seg"
+        if [ -L "$cur_check" ] || { [ -e "$cur_check" ] && [ ! -d "$cur_check" ]; }; then
+            return 1
+        fi
+    done
+    mkdir -p "$target_root/$rel_parent" 2>/dev/null || return 1
+    return 0
+}
+
+copy_leaf_cow() {
+    src_file="$1"
+    dst_file="$2"
+    if [ -e "$dst_file" ] || [ -L "$dst_file" ]; then
+        return 2
+    fi
+    probe_cow_mode
+    case "$WTI_CP_MODE" in
+        gnu_reflink)
+            cp --reflink=auto -P -p "$src_file" "$dst_file" 2>/dev/null || cp -P "$src_file" "$dst_file"
+            ;;
+        bsd_clone)
+            cp -c -P -p "$src_file" "$dst_file" 2>/dev/null || cp -P -p "$src_file" "$dst_file" 2>/dev/null || cp -P "$src_file" "$dst_file"
+            ;;
+        *)
+            cp -P -p "$src_file" "$dst_file" 2>/dev/null || cp -P "$src_file" "$dst_file"
+            ;;
+    esac
+}
+
+copy_dir_cow() {
+    src_dir="${1%/}"
+    dst_dir="${2%/}"
+    if [ -e "$dst_dir" ] || [ -L "$dst_dir" ]; then
+        return 2
+    fi
+    probe_cow_mode
+    case "$WTI_CP_MODE" in
+        gnu_reflink)
+            cp --reflink=auto -R -P -p "$src_dir" "$dst_dir" 2>/dev/null || cp -R -P "$src_dir" "$dst_dir"
+            ;;
+        bsd_clone)
+            cp -c -R -P -p "$src_dir" "$dst_dir" 2>/dev/null || cp -R -P -p "$src_dir" "$dst_dir" 2>/dev/null || cp -R -P "$src_dir" "$dst_dir"
+            ;;
+        *)
+            cp -R -P -p "$src_dir" "$dst_dir" 2>/dev/null || cp -R -P "$src_dir" "$dst_dir"
+            ;;
+    esac
+}
+
+is_path_tracked_in_target() {
+    tracked_list="$1"
+    q_path="$2"
+    [ -s "$tracked_list" ] || return 1
+    awk -v p="$q_path" '$0 == p { found = 1; exit } END { exit(found ? 0 : 1) }' "$tracked_list"
+}
+
+has_tracked_descendant_in_target() {
+    tracked_list="$1"
+    q_dir="${2%/}/"
+    [ -s "$tracked_list" ] || return 1
+    awk -v d="$q_dir" 'substr($0, 1, length(d)) == d { found = 1; exit } END { exit(found ? 0 : 1) }' "$tracked_list"
+}
+
+# Recursively backfill missing entries for a directory that already exists or contains tracked paths in target
+backfill_directory() {
+    main_wt="$1"
+    target_wt="$2"
+    rel_dir="${3%/}"
+    tracked_file="$4"
+    dry_run="$5"
+
+    src_dir="$main_wt/$rel_dir"
+    dst_dir="$target_wt/$rel_dir"
+
+    [ -d "$src_dir" ] && [ ! -L "$src_dir" ] || return 0
+    if [ -e "$src_dir/.git" ] || [ -L "$src_dir/.git" ]; then
+        log_verbose "skipped nested git repository: $rel_dir/"
+        return 0
+    fi
+    if is_path_tracked_in_target "$tracked_file" "$rel_dir"; then
+        log_verbose "skipped tracked path: $rel_dir"
+        return 0
+    fi
+    if [ -L "$dst_dir" ] || { [ -e "$dst_dir" ] && [ ! -d "$dst_dir" ]; }; then
+        log_verbose "skipped existing non-directory in target: $rel_dir"
+        return 0
+    fi
+
+    has_any_entry=0
+    for entry in "$src_dir"/* "$src_dir"/.[!.]* "$src_dir"/..?*; do
+        if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
+            continue
+        fi
+        base_name="${entry##*/}"
+        if [ "$base_name" = ".git" ]; then
+            continue
+        fi
+        has_any_entry=1
+        child_rel="$rel_dir/$base_name"
+        dst_child="$target_wt/$child_rel"
+
+        if [ -d "$entry" ] && [ ! -L "$entry" ]; then
+            if [ -e "$entry/.git" ] || [ -L "$entry/.git" ]; then
+                log_verbose "skipped nested git repository: $child_rel/"
+                continue
+            fi
+            if is_path_tracked_in_target "$tracked_file" "$child_rel"; then
+                log_verbose "skipped tracked path: $child_rel"
+                continue
+            fi
+            if [ ! -e "$dst_child" ] && [ ! -L "$dst_child" ] && ! has_tracked_descendant_in_target "$tracked_file" "$child_rel"; then
+                if [ "$dry_run" = "1" ]; then
+                    printf '%s/\n' "$child_rel"
+                    WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+                else
+                    if ensure_safe_parent_dir "$target_wt" "$child_rel" && copy_dir_cow "$entry" "$dst_child"; then
+                        WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+                        log_verbose "copied directory: $child_rel/"
+                    else
+                        WTI_ERROR_COUNT=$((WTI_ERROR_COUNT + 1))
+                        log_warn "failed to copy directory '$child_rel/'"
+                    fi
+                fi
+            else
+                backfill_directory "$1" "$2" "$child_rel" "$4" "$5"
+                # Positional parameters ($1..$5) are function-scoped in POSIX sh; restore from stack frame
+                main_wt="$1"
+                target_wt="$2"
+                rel_dir="${3%/}"
+                tracked_file="$4"
+                dry_run="$5"
+                src_dir="$main_wt/$rel_dir"
+                dst_dir="$target_wt/$rel_dir"
+                has_any_entry=1
+            fi
+        else
+            if is_path_tracked_in_target "$tracked_file" "$child_rel"; then
+                log_verbose "skipped tracked path: $child_rel"
+                continue
+            fi
+            if [ -e "$dst_child" ] || [ -L "$dst_child" ]; then
+                log_verbose "skipped existing path: $child_rel"
+                continue
+            fi
+            if [ "$dry_run" = "1" ]; then
+                printf '%s\n' "$child_rel"
+                WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+            else
+                if ensure_safe_parent_dir "$target_wt" "$child_rel" && copy_leaf_cow "$entry" "$dst_child"; then
+                    WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+                    log_verbose "copied: $child_rel"
+                else
+                    WTI_ERROR_COUNT=$((WTI_ERROR_COUNT + 1))
+                    log_warn "failed to copy '$child_rel'"
+                fi
+            fi
+        fi
+    done
+
+    # Empty source directory that did not yet exist in target
+    if [ "$has_any_entry" = "0" ] && [ ! -e "$dst_dir" ] && [ ! -L "$dst_dir" ]; then
+        if [ "$dry_run" = "1" ]; then
+            printf '%s/\n' "$rel_dir"
+            WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+        else
+            if ensure_safe_parent_dir "$target_wt" "$rel_dir" && mkdir -p "$dst_dir" 2>/dev/null; then
+                WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+                log_verbose "created empty directory: $rel_dir/"
+            else
+                WTI_ERROR_COUNT=$((WTI_ERROR_COUNT + 1))
+                log_warn "failed to create directory '$rel_dir/'"
+            fi
+        fi
+    fi
+}
+
+collect_target_tracked_paths() {
+    target_wt="$1"
+    out_tracked="$2"
+    raw_tracked="$WTI_TMP/target_tracked_raw"
+    : > "$raw_tracked"
+    git -C "$target_wt" -c core.quotePath=false ls-files 2>/dev/null | tr -d '\r' >> "$raw_tracked" || true
+    git -C "$target_wt" -c core.quotePath=false ls-tree -r --name-only HEAD 2>/dev/null | tr -d '\r' >> "$raw_tracked" || true
+    LC_ALL=C sort -u "$raw_tracked" > "$out_tracked"
+}
+
+# Preview matched candidates in the primary worktree itself (apply --dry-run from primary worktree)
+preview_primary_candidates() {
+    main_wt="$1"
+    candidates_file="$2"
+    WTI_COPIED_COUNT=0
+    while IFS= read -r cand; do
+        [ -z "$cand" ] && continue
+        case "$cand" in
+            .git|.git/*|*/.git|*/.git/*) continue ;;
+        esac
+        case "$cand" in
+            */)
+                rel_dir="${cand%/}"
+                if [ -e "$main_wt/$rel_dir/.git" ] || [ -L "$main_wt/$rel_dir/.git" ]; then
+                    log_verbose "skipped nested git repository: $cand"
+                    continue
+                fi
+                if [ -d "$main_wt/$rel_dir" ] || [ -L "$main_wt/$rel_dir" ]; then
+                    printf '%s\n' "$cand"
+                    WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+                fi
+                ;;
+            *)
+                if [ -e "$main_wt/$cand" ] || [ -L "$main_wt/$cand" ]; then
+                    printf '%s\n' "$cand"
+                    WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+                fi
+                ;;
+        esac
+    done < "$candidates_file"
+}
+
+# Sync matched paths from main_wt into a linked target_wt
+sync_worktree() {
+    main_wt="$1"
+    target_wt="$2"
+    candidates_file="$3"
+    dry_run="$4"
+
+    WTI_COPIED_COUNT=0
+    WTI_ERROR_COUNT=0
+
+    tracked_file="$WTI_TMP/target_tracked"
+    collect_target_tracked_paths "$target_wt" "$tracked_file"
+
+    plan_file="$WTI_TMP/sync_plan"
+    awk '
+        NR == FNR {
+            if ($0 != "") {
+                tracked[$0] = 1
+                n = split($0, parts, "/")
+                anc = ""
+                for (i = 1; i < n; i++) {
+                    anc = (anc == "" ? parts[i] : anc "/" parts[i])
+                    tracked_under[anc "/"] = 1
+                }
+            }
+            next
+        }
+        {
+            cand = $0
+            if (cand == "") next
+            if (substr(cand, length(cand), 1) == "/") {
+                d = substr(cand, 1, length(cand) - 1)
+                if (tracked[d]) {
+                    print "SKIP_TRACKED\t" cand
+                } else if (tracked_under[cand]) {
+                    print "DIR_PARTIAL\t" d
+                } else {
+                    print "DIR_WHOLE\t" d
+                }
+            } else {
+                if (tracked[cand]) {
+                    print "SKIP_TRACKED\t" cand
+                } else {
+                    print "LEAF\t" cand
+                }
+            }
+        }
+    ' "$tracked_file" "$candidates_file" > "$plan_file"
+
+    tab_char=$(printf '\t')
+    while IFS= read -r entry_line; do
+        [ -z "$entry_line" ] && continue
+        action="${entry_line%%"$tab_char"*}"
+        rel_p="${entry_line#*"$tab_char"}"
+
+        case "$rel_p" in
+            .git|.git/*|*/.git|*/.git/*) continue ;;
+        esac
+
+        case "$action" in
+            SKIP_TRACKED)
+                log_verbose "skipped tracked path: $rel_p"
+                ;;
+            LEAF)
+                src_p="$main_wt/$rel_p"
+                dst_p="$target_wt/$rel_p"
+                if [ ! -e "$src_p" ] && [ ! -L "$src_p" ]; then
+                    continue
+                fi
+                if [ -e "$dst_p" ] || [ -L "$dst_p" ]; then
+                    log_verbose "skipped existing path: $rel_p"
+                    continue
+                fi
+                if [ "$dry_run" = "1" ]; then
+                    printf '%s\n' "$rel_p"
+                    WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+                else
+                    if ensure_safe_parent_dir "$target_wt" "$rel_p" && copy_leaf_cow "$src_p" "$dst_p"; then
+                        WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+                        log_verbose "copied: $rel_p"
+                    else
+                        WTI_ERROR_COUNT=$((WTI_ERROR_COUNT + 1))
+                        log_warn "failed to copy '$rel_p'"
+                    fi
+                fi
+                ;;
+            DIR_WHOLE)
+                src_d="$main_wt/$rel_p"
+                dst_d="$target_wt/$rel_p"
+                if [ ! -d "$src_d" ] && [ ! -L "$src_d" ]; then
+                    continue
+                fi
+                if [ -L "$src_d" ]; then
+                    # Directory symlink
+                    if [ -e "$dst_d" ] || [ -L "$dst_d" ]; then
+                        log_verbose "skipped existing path: $rel_p"
+                        continue
+                    fi
+                    if [ "$dry_run" = "1" ]; then
+                        printf '%s\n' "$rel_p"
+                        WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+                    else
+                        if ensure_safe_parent_dir "$target_wt" "$rel_p" && copy_leaf_cow "$src_d" "$dst_d"; then
+                            WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+                            log_verbose "copied symlink: $rel_p"
+                        else
+                            WTI_ERROR_COUNT=$((WTI_ERROR_COUNT + 1))
+                            log_warn "failed to copy symlink '$rel_p'"
+                        fi
+                    fi
+                else
+                    if [ -e "$src_d/.git" ] || [ -L "$src_d/.git" ]; then
+                        log_verbose "skipped nested git repository: $rel_p/"
+                        continue
+                    fi
+                    if [ ! -e "$dst_d" ] && [ ! -L "$dst_d" ]; then
+                        if [ "$dry_run" = "1" ]; then
+                            printf '%s/\n' "$rel_p"
+                            WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+                        else
+                            if ensure_safe_parent_dir "$target_wt" "$rel_p" && copy_dir_cow "$src_d" "$dst_d"; then
+                                WTI_COPIED_COUNT=$((WTI_COPIED_COUNT + 1))
+                                log_verbose "copied directory: $rel_p/"
+                            else
+                                WTI_ERROR_COUNT=$((WTI_ERROR_COUNT + 1))
+                                log_warn "failed to copy directory '$rel_p/'"
+                            fi
+                        fi
+                    else
+                        backfill_directory "$main_wt" "$target_wt" "$rel_p" "$tracked_file" "$dry_run"
+                    fi
+                fi
+                ;;
+            DIR_PARTIAL)
+                backfill_directory "$main_wt" "$target_wt" "$rel_p" "$tracked_file" "$dry_run"
+                ;;
+        esac
+    done < "$plan_file"
+}
+
+format_count_noun() {
+    if [ "$1" = "1" ]; then
+        printf '1 path'
+    else
+        printf '%s paths' "$1"
+    fi
+}
+
+# Automatic post-checkout hook handler: non-blocking (always exits 0)
+cmd_hook_post_checkout() {
+    prev_head="${1:-}"
+    # Fast-path: only run on initial checkout of a newly created worktree (prev_head == 0000...)
+    if ! is_zero_oid "$prev_head"; then
+        exit 0
+    fi
+
+    cur_top=$(git -c core.quotePath=false rev-parse --show-toplevel 2>/dev/null || true)
+    if [ -z "$cur_top" ] || [ ! -d "$cur_top" ]; then
+        exit 0
+    fi
+    cur_wt=$(canon_dir "$cur_top" || true)
+    [ -n "$cur_wt" ] || exit 0
+
+    ensure_tmp || exit 0
+    main_wt=$(resolve_primary_worktree "$cur_wt" "$cur_wt" || true)
+    if [ -z "$main_wt" ] || [ "$cur_wt" = "$main_wt" ]; then
+        # Either no non-bare worktree or this checkout is inside the primary worktree itself (e.g. git clone)
+        exit 0
+    fi
+
+    wti_list="$WTI_TMP/wti_files"
+    discover_worktreeinclude_files "$main_wt" "$wti_list"
+    if [ ! -s "$wti_list" ]; then
+        exit 0
+    fi
+
+    candidates="$WTI_TMP/candidates"
+    collect_matched_candidates "$main_wt" "$wti_list" "$candidates"
+    if [ ! -s "$candidates" ]; then
+        exit 0
+    fi
+
+    sync_worktree "$main_wt" "$cur_wt" "$candidates" "0" || true
+    if [ "$WTI_COPIED_COUNT" -gt 0 ]; then
+        log_info "copied $(format_count_noun "$WTI_COPIED_COUNT") from primary worktree"
+    fi
+    exit 0
+}
+
+# Generate a managed global passthrough stub for a standard Git hook so local .git/hooks/<hook> keeps working
+write_passthrough_hook() {
+    hooks_dir="$1"
+    hook_name="$2"
+    q_hooks_canon="$3"
+    hook_path="$hooks_dir/$hook_name"
+    [ ! -e "$hook_path" ] && [ ! -L "$hook_path" ] || return 0
+
+    cat > "$hook_path" <<EOF
+#!/bin/sh
+$WTI_PASSTHROUGH_MARKER
+case ":\${_GIT_WTI_FWD_ACTIVE:-}:" in
+    *":$hook_name:"*) exit 0 ;;
+esac
+common_dir=\$(git rev-parse --git-common-dir 2>/dev/null) || exit 0
+local_hooks="\$common_dir/hooks"
+if [ -d "\$local_hooks" ]; then
+    local_canon=\$(cd "\$local_hooks" 2>/dev/null && pwd -P)
+    self_canon=$q_hooks_canon
+    if [ -n "\$local_canon" ] && [ "\$local_canon" != "\$self_canon" ]; then
+        local_hook="\$local_hooks/$hook_name"
+        if [ -f "\$local_hook" ] && [ -x "\$local_hook" ]; then
+            _GIT_WTI_FWD_ACTIVE="\${_GIT_WTI_FWD_ACTIVE:-}:$hook_name"
+            export _GIT_WTI_FWD_ACTIVE
+            exec "\$local_hook" "\$@"
+        fi
+    fi
+fi
+exit 0
+EOF
+}
+
+build_managed_post_checkout_snippet() {
+    script_native_path="$1"
+    include_local_fwd="$2"
+    hooks_canon="$3"
+    q_script=$(sh_quote "$script_native_path")
+    q_hooks_canon=$(sh_quote "$hooks_canon")
+
+    printf '%s\n' "$WTI_BLOCK_BEGIN"
+    printf '(\n'
+    printf '    if [ -f %s ]; then\n' "$q_script"
+    printf '        sh %s _hook-post-checkout "$@" || true\n' "$q_script"
+    printf '    fi\n'
+    printf ') </dev/null || true\n'
+    if [ "$include_local_fwd" = "1" ]; then
+        cat <<EOF
+if [ "\${_GIT_WTI_FWD_POST_CHECKOUT:-0}" != "1" ]; then
+    _wti_common=\$(git rev-parse --git-common-dir 2>/dev/null || true)
+    if [ -n "\$_wti_common" ] && [ -d "\$_wti_common/hooks" ]; then
+        _wti_lcanon=\$(cd "\$_wti_common/hooks" 2>/dev/null && pwd -P)
+        if [ -n "\$_wti_lcanon" ] && [ "\$_wti_lcanon" != $q_hooks_canon ] && [ -f "\$_wti_common/hooks/post-checkout" ] && [ -x "\$_wti_common/hooks/post-checkout" ]; then
+            _GIT_WTI_FWD_POST_CHECKOUT=1 _wti_rc=0
+            export _GIT_WTI_FWD_POST_CHECKOUT
+            "\$_wti_common/hooks/post-checkout" "\$@" || _wti_rc=\$?
+            unset _GIT_WTI_FWD_POST_CHECKOUT
+            [ "\$_wti_rc" -eq 0 ] || exit "\$_wti_rc"
+        fi
+    fi
+fi
+EOF
+    fi
+    printf '%s\n' "$WTI_BLOCK_END"
+}
+
+is_posix_or_bash_hook() {
+    hook_file="$1"
+    first_line=$(sed -n '1p' "$hook_file" 2>/dev/null | tr -d '\r')
+    case "$first_line" in
+        ""|\#!\ */sh|\#!\ */sh\ *|\#!/*/sh|\#!/*/sh\ *|\#!\ */bash|\#!\ */bash\ *|\#!/*/bash|\#!/*/bash\ *|\#!/usr/bin/env\ sh*|\#!/usr/bin/env\ bash*)
+            return 0
+            ;;
+        \#!*)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+install_post_checkout_hook() {
+    hooks_dir="$1"
+    script_native="$2"
+    is_global_passthrough="$3"
+
+    mkdir -p "$hooks_dir" || return 1
+    hooks_canon=$(canon_dir "$hooks_dir") || return 1
+    hook_file="$hooks_dir/post-checkout"
+    ensure_tmp || return 1
+    snippet_file="$WTI_TMP/post_checkout_snippet"
+    out_hook="$WTI_TMP/post_checkout_out"
+
+    # Case 1: No post-checkout exists yet
+    if [ ! -e "$hook_file" ] && [ ! -L "$hook_file" ]; then
+        build_managed_post_checkout_snippet "$script_native" "$is_global_passthrough" "$hooks_canon" > "$snippet_file"
+        {
+            printf '#!/bin/sh\n'
+            printf '%s\n' "$WTI_PASSTHROUGH_MARKER"
+            cat "$snippet_file"
+        } > "$out_hook"
+        chmod +x "$out_hook" 2>/dev/null || true
+        mv -f "$out_hook" "$hook_file" || return 1
+        chmod +x "$hook_file" 2>/dev/null || true
+        return 0
+    fi
+
+    # Case 2: Existing wrapper around a non-shell hook (re-install)
+    if grep -q "^$WTI_WRAPPER_MARKER$" "$hook_file" 2>/dev/null; then
+        backup_hook="$hook_file.pre-worktreeinclude"
+        build_managed_post_checkout_snippet "$script_native" "0" "$hooks_canon" > "$snippet_file"
+        {
+            printf '#!/bin/sh\n'
+            printf '%s\n' "$WTI_WRAPPER_MARKER"
+            cat "$snippet_file"
+            printf 'if [ -x %s ]; then\n' "$(sh_quote "$backup_hook")"
+            printf '    exec %s "$@"\n' "$(sh_quote "$backup_hook")"
+            printf 'fi\n'
+        } > "$out_hook"
+        chmod +x "$out_hook" 2>/dev/null || true
+        mv -f "$out_hook" "$hook_file" || return 1
+        chmod +x "$hook_file" 2>/dev/null || true
+        return 0
+    fi
+
+    # Case 3: Existing non-shell executable hook (e.g. #!/usr/bin/env python3 / node / binary)
+    if ! is_posix_or_bash_hook "$hook_file"; then
+        backup_hook="$hook_file.pre-worktreeinclude"
+        cp -P -p "$hook_file" "$backup_hook" 2>/dev/null || cp "$hook_file" "$backup_hook" || return 1
+        chmod +x "$backup_hook" 2>/dev/null || true
+        build_managed_post_checkout_snippet "$script_native" "0" "$hooks_canon" > "$snippet_file"
+        {
+            printf '#!/bin/sh\n'
+            printf '%s\n' "$WTI_WRAPPER_MARKER"
+            cat "$snippet_file"
+            printf 'exec %s "$@"\n' "$(sh_quote "$backup_hook")"
+        } > "$out_hook"
+        chmod +x "$out_hook" 2>/dev/null || true
+        mv -f "$out_hook" "$hook_file" || return 1
+        chmod +x "$hook_file" 2>/dev/null || true
+        return 0
+    fi
+
+    # Case 4: Existing sh/bash post-checkout hook (replace existing block if present, else inject right after shebang)
+    need_fwd=0
+    if [ "$is_global_passthrough" = "1" ] && grep -q "^$WTI_PASSTHROUGH_MARKER$" "$hook_file" 2>/dev/null; then
+        need_fwd=1
+    fi
+    build_managed_post_checkout_snippet "$script_native" "$need_fwd" "$hooks_canon" > "$snippet_file"
+
+    if grep -q "^$WTI_BLOCK_BEGIN$" "$hook_file" 2>/dev/null; then
+        awk -v b="$WTI_BLOCK_BEGIN" -v e="$WTI_BLOCK_END" -v sf="$snippet_file" '
+            $0 == b || $0 == b "\r" {
+                while ((getline sline < sf) > 0) print sline
+                close(sf)
+                in_block = 1
+                next
+            }
+            $0 == e || $0 == e "\r" {
+                in_block = 0
+                next
+            }
+            !in_block { print }
+        ' "$hook_file" > "$out_hook"
+    else
+        awk -v sf="$snippet_file" '
+            NR == 1 {
+                if (substr($0, 1, 2) == "#!") {
+                    print $0
+                    while ((getline sline < sf) > 0) print sline
+                    close(sf)
+                } else {
+                    print "#!/bin/sh"
+                    while ((getline sline < sf) > 0) print sline
+                    close(sf)
+                    print $0
+                }
+                next
+            }
+            { print }
+            END {
+                if (NR == 0) {
+                    print "#!/bin/sh"
+                    while ((getline sline < sf) > 0) print sline
+                    close(sf)
+                }
+            }
+        ' "$hook_file" > "$out_hook"
+    fi
+
+    chmod +x "$out_hook" 2>/dev/null || true
+    mv -f "$out_hook" "$hook_file" || return 1
+    chmod +x "$hook_file" 2>/dev/null || true
+    return 0
+}
+
+remove_post_checkout_hook() {
+    hooks_dir="$1"
+    hook_file="$hooks_dir/post-checkout"
+    [ -e "$hook_file" ] || [ -L "$hook_file" ] || return 0
+
+    if grep -q "^$WTI_WRAPPER_MARKER$" "$hook_file" 2>/dev/null; then
+        backup_hook="$hook_file.pre-worktreeinclude"
+        if [ -e "$backup_hook" ] || [ -L "$backup_hook" ]; then
+            mv -f "$backup_hook" "$hook_file"
+        else
+            rm -f "$hook_file"
+        fi
+        return 0
+    fi
+
+    if ! grep -q "^$WTI_BLOCK_BEGIN$" "$hook_file" 2>/dev/null; then
+        if grep -q "^$WTI_PASSTHROUGH_MARKER$" "$hook_file" 2>/dev/null; then
+            rm -f "$hook_file"
+        fi
+        return 0
+    fi
+
+    ensure_tmp || return 1
+    stripped_hook="$WTI_TMP/post_checkout_stripped"
+    awk -v b="$WTI_BLOCK_BEGIN" -v e="$WTI_BLOCK_END" '
+        $0 == b || $0 == b "\r" { in_block = 1; next }
+        $0 == e || $0 == e "\r" { in_block = 0; next }
+        !in_block { print }
+    ' "$hook_file" > "$stripped_hook"
+
+    # If file was wholly created by us (contains passthrough marker or only shebang/whitespace), delete it
+    rem_nonempty=$(awk -v pm="$WTI_PASSTHROUGH_MARKER" '
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            if (NR == 1 && substr(line, 1, 2) == "#!") next
+            if (line == pm) next
+            gsub(/[ \t]/, "", line)
+            if (line != "") count++
+        }
+        END { print count + 0 }
+    ' "$stripped_hook")
+
+    if [ "$rem_nonempty" = "0" ]; then
+        rm -f "$hook_file"
+    else
+        chmod +x "$stripped_hook" 2>/dev/null || true
+        mv -f "$stripped_hook" "$hook_file"
+        chmod +x "$hook_file" 2>/dev/null || true
+    fi
+}
+
+resolve_repo_common_dir() {
+    repo_ctx="${1:-.}"
+    c_dir=$(git -C "$repo_ctx" -c core.quotePath=false rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    if [ -z "$c_dir" ]; then
+        c_dir=$(git -C "$repo_ctx" -c core.quotePath=false rev-parse --git-common-dir 2>/dev/null || true)
+        if [ -n "$c_dir" ]; then
+            case "$c_dir" in
+                /*|[A-Za-z]:/*|[A-Za-z]:\\*) ;;
+                *) c_dir="$repo_ctx/$c_dir" ;;
+            esac
+        fi
+    fi
+    [ -n "$c_dir" ] && [ -d "$c_dir" ] || return 1
+    canon_dir "$c_dir"
+}
+
+resolve_local_hooks_dir() {
+    repo_ctx="${1:-.}"
+    common_dir=$(resolve_repo_common_dir "$repo_ctx") || return 1
+    local_hp=$(git -C "$repo_ctx" config --local --get core.hooksPath 2>/dev/null || true)
+    if [ -n "$local_hp" ]; then
+        case "$local_hp" in
+            "~") local_hp="$HOME" ;;
+            "~/"*) local_hp="${HOME%/}/${local_hp#"~/"}" ;;
+            /*|[A-Za-z]:/*|[A-Za-z]:\\*) ;;
+            *)
+                top_dir=$(git -C "$repo_ctx" -c core.quotePath=false rev-parse --show-toplevel 2>/dev/null || printf '%s' "$common_dir")
+                local_hp="$top_dir/$local_hp"
+                ;;
+        esac
+        mkdir -p "$local_hp" || return 1
+        canon_dir "$local_hp"
+    else
+        mkdir -p "$common_dir/hooks" || return 1
+        canon_dir "$common_dir/hooks"
+    fi
+}
+
+expand_user_path() {
+    p="$1"
+    case "$p" in
+        "~") printf '%s\n' "$HOME" ;;
+        "~/"*) printf '%s/%s\n' "${HOME%/}" "${p#"~/"}" ;;
+        *) printf '%s\n' "$p" ;;
+    esac
+}
+
+cmd_install() {
+    scope="global"
+    custom_hooks_dir=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --local)
+                scope="local"
+                shift
+                ;;
+            --global)
+                scope="global"
+                shift
+                ;;
+            --hooks-dir)
+                [ $# -ge 2 ] || { log_err "--hooks-dir requires a directory argument"; exit 1; }
+                custom_hooks_dir="$2"
+                shift 2
+                ;;
+            --hooks-dir=*)
+                custom_hooks_dir="${1#--hooks-dir=}"
+                shift
+                ;;
+            -v|--verbose)
+                WTI_VERBOSE=1
+                shift
+                ;;
+            -h|--help)
+                print_help
+                exit 0
+                ;;
+            *)
+                log_err "unknown option for install: $1"
+                exit 1
+                ;;
+        esac
+    done
+
+    self_src=$(resolve_self_source || true)
+    if [ -z "$self_src" ]; then
+        log_err "cannot locate git-worktreeinclude script source; run 'sh ./git-worktreeinclude install' from the downloaded script"
+        exit 1
+    fi
+
+    if [ "$scope" = "local" ]; then
+        common_dir=$(resolve_repo_common_dir "." || true)
+        if [ -z "$common_dir" ]; then
+            log_err "--local install must be run inside a Git repository"
+            exit 1
+        fi
+
+        local_bin_dir="$common_dir/worktreeinclude"
+        installed_script="$local_bin_dir/git-worktreeinclude"
+        copy_script_clean "$self_src" "$installed_script" || {
+            log_err "failed to install script to '$installed_script'"
+            exit 1
+        }
+        script_native=$(native_git_path "$(canon_dir "$local_bin_dir")/git-worktreeinclude")
+
+        if [ -n "$custom_hooks_dir" ]; then
+            exp_hd=$(expand_user_path "$custom_hooks_dir")
+            mkdir -p "$exp_hd" || { log_err "failed to create hooks directory '$exp_hd'"; exit 1; }
+            hooks_dir=$(canon_dir "$exp_hd")
+            hooks_native=$(native_git_path "$hooks_dir")
+            existing_lhp=$(git config --local --get core.hooksPath 2>/dev/null || true)
+            if [ -z "$existing_lhp" ]; then
+                git config --local core.hooksPath "$hooks_native"
+                git config --local worktreeinclude.managedHooksPath "$hooks_native"
+            fi
+        else
+            hooks_dir=$(resolve_local_hooks_dir ".") || {
+                log_err "failed to resolve repository hooks directory"
+                exit 1
+            }
+        fi
+
+        install_post_checkout_hook "$hooks_dir" "$script_native" "0" || {
+            log_err "failed to configure post-checkout hook in '$hooks_dir'"
+            exit 1
+        }
+
+        hooks_native=$(native_git_path "$hooks_dir")
+        git config --local worktreeinclude.hooksDir "$hooks_native"
+        git config --local alias.worktreeinclude "!sh $(sh_quote "$script_native")"
+
+        log_info "installed locally in repository (hooks: $hooks_native)"
+        return 0
+    fi
+
+    # Global install
+    data_dir=$(get_global_data_dir)
+    mkdir -p "$data_dir" || { log_err "failed to create '$data_dir'"; exit 1; }
+    data_canon=$(canon_dir "$data_dir")
+    installed_script="$data_canon/git-worktreeinclude"
+    copy_script_clean "$self_src" "$installed_script" || {
+        log_err "failed to install script to '$installed_script'"
+        exit 1
+    }
+    script_native=$(native_git_path "$installed_script")
+
+    existing_ghp=$(git config --global --get core.hooksPath 2>/dev/null || true)
+    prev_managed_ghp=$(git config --global --get worktreeinclude.managedHooksPath 2>/dev/null || true)
+
+    we_manage_ghp=0
+    if [ -n "$custom_hooks_dir" ]; then
+        exp_hd=$(expand_user_path "$custom_hooks_dir")
+        mkdir -p "$exp_hd" || { log_err "failed to create hooks directory '$exp_hd'"; exit 1; }
+        hooks_dir=$(canon_dir "$exp_hd")
+        hooks_native=$(native_git_path "$hooks_dir")
+        if [ -z "$existing_ghp" ] || [ "$existing_ghp" = "$prev_managed_ghp" ]; then
+            we_manage_ghp=1
+            git config --global core.hooksPath "$hooks_native"
+            git config --global worktreeinclude.managedHooksPath "$hooks_native"
+        fi
+    elif [ -n "$existing_ghp" ] && [ "$existing_ghp" != "$prev_managed_ghp" ]; then
+        exp_hd=$(expand_user_path "$existing_ghp")
+        mkdir -p "$exp_hd" || { log_err "failed to access existing global core.hooksPath '$exp_hd'"; exit 1; }
+        hooks_dir=$(canon_dir "$exp_hd")
+        hooks_native=$(native_git_path "$hooks_dir")
+    else
+        we_manage_ghp=1
+        mkdir -p "$data_canon/hooks" || { log_err "failed to create '$data_canon/hooks'"; exit 1; }
+        hooks_dir=$(canon_dir "$data_canon/hooks")
+        hooks_native=$(native_git_path "$hooks_dir")
+        git config --global core.hooksPath "$hooks_native"
+        git config --global worktreeinclude.managedHooksPath "$hooks_native"
+    fi
+
+    if [ "$we_manage_ghp" = "1" ]; then
+        q_hooks_canon=$(sh_quote "$hooks_dir")
+        for h_name in $WTI_STANDARD_HOOKS; do
+            [ "$h_name" = "post-checkout" ] && continue
+            write_passthrough_hook "$hooks_dir" "$h_name" "$q_hooks_canon"
+        done
+        chmod +x "$hooks_dir"/* 2>/dev/null || true
+        install_post_checkout_hook "$hooks_dir" "$script_native" "1" || {
+            log_err "failed to install global post-checkout hook"
+            exit 1
+        }
+    else
+        install_post_checkout_hook "$hooks_dir" "$script_native" "0" || {
+            log_err "failed to update existing global post-checkout hook in '$hooks_dir'"
+            exit 1
+        }
+    fi
+
+    git config --global worktreeinclude.hooksDir "$hooks_native"
+    git config --global alias.worktreeinclude "!sh $(sh_quote "$script_native")"
+
+    log_info "installed globally (hooks: $hooks_native, command: 'git worktreeinclude')"
+}
+
+cmd_uninstall() {
+    scope="global"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --local)
+                scope="local"
+                shift
+                ;;
+            --global)
+                scope="global"
+                shift
+                ;;
+            -v|--verbose)
+                WTI_VERBOSE=1
+                shift
+                ;;
+            -h|--help)
+                print_help
+                exit 0
+                ;;
+            *)
+                log_err "unknown option for uninstall: $1"
+                exit 1
+                ;;
+        esac
+    done
+
+    if [ "$scope" = "local" ]; then
+        common_dir=$(resolve_repo_common_dir "." || true)
+        if [ -z "$common_dir" ]; then
+            log_err "--local uninstall must be run inside a Git repository"
+            exit 1
+        fi
+
+        rec_hooks=$(git config --local --get worktreeinclude.hooksDir 2>/dev/null || true)
+        if [ -z "$rec_hooks" ]; then
+            rec_hooks=$(resolve_local_hooks_dir "." 2>/dev/null || printf '%s/hooks' "$common_dir")
+        fi
+        if [ -n "$rec_hooks" ] && [ -d "$rec_hooks" ]; then
+            remove_post_checkout_hook "$rec_hooks"
+        fi
+
+        managed_lhp=$(git config --local --get worktreeinclude.managedHooksPath 2>/dev/null || true)
+        cur_lhp=$(git config --local --get core.hooksPath 2>/dev/null || true)
+        if [ -n "$managed_lhp" ] && [ "$cur_lhp" = "$managed_lhp" ]; then
+            git config --local --unset core.hooksPath 2>/dev/null || true
+        fi
+        git config --local --unset-all worktreeinclude.managedHooksPath 2>/dev/null || true
+        git config --local --unset-all worktreeinclude.hooksDir 2>/dev/null || true
+        git config --local --remove-section worktreeinclude 2>/dev/null || true
+
+        local_alias=$(git config --local --get alias.worktreeinclude 2>/dev/null || true)
+        case "$local_alias" in
+            *worktreeinclude*)
+                git config --local --unset-all alias.worktreeinclude 2>/dev/null || true
+                ;;
+        esac
+
+        rm -f "$common_dir/worktreeinclude/git-worktreeinclude" 2>/dev/null || true
+        rmdir "$common_dir/worktreeinclude" 2>/dev/null || true
+
+        log_info "uninstalled local hook from repository"
+        return 0
+    fi
+
+    # Global uninstall
+    data_dir=$(get_global_data_dir)
+    rec_hooks=$(git config --global --get worktreeinclude.hooksDir 2>/dev/null || true)
+    if [ -z "$rec_hooks" ]; then
+        cur_ghp=$(git config --global --get core.hooksPath 2>/dev/null || true)
+        if [ -n "$cur_ghp" ]; then
+            rec_hooks=$(expand_user_path "$cur_ghp")
+        else
+            rec_hooks="$data_dir/hooks"
+        fi
+    fi
+
+    if [ -n "$rec_hooks" ] && [ -d "$rec_hooks" ]; then
+        remove_post_checkout_hook "$rec_hooks"
+        for h_name in $WTI_STANDARD_HOOKS; do
+            h_file="$rec_hooks/$h_name"
+            if [ -f "$h_file" ] && grep -q "^$WTI_PASSTHROUGH_MARKER$" "$h_file" 2>/dev/null; then
+                rm -f "$h_file" 2>/dev/null || true
+            fi
+        done
+        rmdir "$rec_hooks" 2>/dev/null || true
+    fi
+
+    managed_ghp=$(git config --global --get worktreeinclude.managedHooksPath 2>/dev/null || true)
+    cur_ghp=$(git config --global --get core.hooksPath 2>/dev/null || true)
+    if [ -n "$managed_ghp" ] && [ "$cur_ghp" = "$managed_ghp" ]; then
+        git config --global --unset core.hooksPath 2>/dev/null || true
+    fi
+    git config --global --unset-all worktreeinclude.managedHooksPath 2>/dev/null || true
+    git config --global --unset-all worktreeinclude.hooksDir 2>/dev/null || true
+    git config --global --remove-section worktreeinclude 2>/dev/null || true
+
+    global_alias=$(git config --global --get alias.worktreeinclude 2>/dev/null || true)
+    case "$global_alias" in
+        *worktreeinclude*)
+            git config --global --unset-all alias.worktreeinclude 2>/dev/null || true
+            ;;
+    esac
+
+    rm -f "$data_dir/git-worktreeinclude" 2>/dev/null || true
+    rmdir "$data_dir/hooks" 2>/dev/null || true
+    rmdir "$data_dir" 2>/dev/null || true
+
+    log_info "uninstalled global git-worktreeinclude hook and alias"
+}
+
+cmd_apply() {
+    dry_run=0
+    apply_all=0
+    target_arg=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -n|--dry-run)
+                dry_run=1
+                shift
+                ;;
+            --all)
+                apply_all=1
+                shift
+                ;;
+            -v|--verbose)
+                WTI_VERBOSE=1
+                shift
+                ;;
+            -h|--help)
+                print_help
+                exit 0
+                ;;
+            -*)
+                log_err "unknown option for apply: $1"
+                exit 1
+                ;;
+            *)
+                if [ -n "$target_arg" ]; then
+                    log_err "apply accepts at most one <worktree-path> argument"
+                    exit 1
+                fi
+                target_arg="$1"
+                shift
+                ;;
+        esac
+    done
+
+    if [ "$apply_all" = "1" ] && [ -n "$target_arg" ]; then
+        log_err "cannot combine --all with an explicit <worktree-path>"
+        exit 1
+    fi
+
+    repo_ctx="."
+    if [ -n "$target_arg" ]; then
+        if [ ! -d "$target_arg" ]; then
+            log_err "target worktree directory does not exist: $target_arg"
+            exit 1
+        fi
+        repo_ctx="$target_arg"
+    fi
+
+    if ! git -C "$repo_ctx" rev-parse --git-dir >/dev/null 2>&1; then
+        log_err "not inside a Git repository"
+        exit 1
+    fi
+
+    ensure_tmp || exit 1
+    main_wt=$(resolve_primary_worktree "$repo_ctx" || true)
+    if [ -z "$main_wt" ]; then
+        log_err "could not resolve a non-bare primary worktree"
+        exit 1
+    fi
+
+    wti_list="$WTI_TMP/wti_files"
+    discover_worktreeinclude_files "$main_wt" "$wti_list"
+    if [ ! -s "$wti_list" ]; then
+        log_info "no .worktreeinclude files found in primary worktree ($main_wt)"
+        return 0
+    fi
+
+    candidates="$WTI_TMP/candidates"
+    collect_matched_candidates "$main_wt" "$wti_list" "$candidates"
+
+    if [ "$apply_all" = "1" ]; then
+        all_wts="$WTI_TMP/all_wts"
+        list_all_nonbare_worktrees "$repo_ctx" > "$all_wts"
+        total_copied=0
+        total_errors=0
+        linked_count=0
+
+        while IFS= read -r wt_item; do
+            [ -z "$wt_item" ] && continue
+            [ "$wt_item" = "$main_wt" ] && continue
+            linked_count=$((linked_count + 1))
+            if [ "$dry_run" = "1" ]; then
+                log_info "dry-run target: $wt_item"
+            fi
+            sync_worktree "$main_wt" "$wt_item" "$candidates" "$dry_run"
+            total_copied=$((total_copied + WTI_COPIED_COUNT))
+            total_errors=$((total_errors + WTI_ERROR_COUNT))
+        done < "$all_wts"
+
+        if [ "$linked_count" = "0" ]; then
+            log_info "no linked worktrees exist yet"
+            return 0
+        fi
+        if [ "$dry_run" = "1" ]; then
+            log_info "dry-run: would copy $(format_count_noun "$total_copied") across $linked_count linked worktree(s)"
+        else
+            log_info "copied $(format_count_noun "$total_copied") across $linked_count linked worktree(s)"
+        fi
+        [ "$total_errors" = "0" ] || exit 1
+        return 0
+    fi
+
+    # Single target worktree (explicit <worktree-path> or current worktree)
+    if [ -n "$target_arg" ]; then
+        target_top=$(git -C "$target_arg" -c core.quotePath=false rev-parse --show-toplevel 2>/dev/null || true)
+        if [ -z "$target_top" ] || [ ! -d "$target_top" ]; then
+            log_err "target path is not a non-bare Git worktree: $target_arg"
+            exit 1
+        fi
+        target_wt=$(canon_dir "$target_top")
+        # Confirm target_wt belongs to the same repository worktree set
+        all_wts="$WTI_TMP/all_wts_check"
+        list_all_nonbare_worktrees "." > "$all_wts" 2>/dev/null || list_all_nonbare_worktrees "$target_wt" > "$all_wts"
+        if ! awk -v t="$target_wt" '$0 == t { ok = 1; exit } END { exit(ok ? 0 : 1) }' "$all_wts"; then
+            log_err "target path is not a worktree of the current repository: $target_arg"
+            exit 1
+        fi
+    else
+        cur_top=$(git -c core.quotePath=false rev-parse --show-toplevel 2>/dev/null || true)
+        if [ -z "$cur_top" ] || [ ! -d "$cur_top" ]; then
+            log_err "current directory is bare; pass <worktree-path> or --all"
+            exit 1
+        fi
+        target_wt=$(canon_dir "$cur_top")
+    fi
+
+    if [ "$target_wt" = "$main_wt" ]; then
+        if [ "$dry_run" = "1" ]; then
+            preview_primary_candidates "$main_wt" "$candidates"
+            log_info "dry-run: $(format_count_noun "$WTI_COPIED_COUNT") in primary worktree would be copied into a new worktree"
+            return 0
+        fi
+        log_info "current directory is the primary worktree; nothing to copy into itself (use --dry-run to preview, or pass <worktree-path> / --all)"
+        return 0
+    fi
+
+    sync_worktree "$main_wt" "$target_wt" "$candidates" "$dry_run"
+    if [ "$dry_run" = "1" ]; then
+        log_info "dry-run: would copy $(format_count_noun "$WTI_COPIED_COUNT") from primary worktree"
+    else
+        log_info "copied $(format_count_noun "$WTI_COPIED_COUNT") from primary worktree"
+    fi
+    [ "$WTI_ERROR_COUNT" = "0" ] || exit 1
+}
+
+hook_has_wti() {
+    hf="$1"
+    [ -f "$hf" ] || return 1
+    grep -q "git-worktreeinclude" "$hf" 2>/dev/null
+}
+
+cmd_status() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -v|--verbose) WTI_VERBOSE=1; shift ;;
+            -h|--help) print_help; exit 0 ;;
+            *) log_err "unknown option for status: $1"; exit 1 ;;
+        esac
+    done
+
+    data_dir=$(get_global_data_dir)
+    global_alias=$(git config --global --get alias.worktreeinclude 2>/dev/null || true)
+    global_hp=$(git config --global --get core.hooksPath 2>/dev/null || true)
+    global_rec_hd=$(git config --global --get worktreeinclude.hooksDir 2>/dev/null || true)
+
+    global_hook_active="no"
+    check_ghd=""
+    if [ -n "$global_hp" ]; then
+        check_ghd=$(expand_user_path "$global_hp")
+    elif [ -n "$global_rec_hd" ]; then
+        check_ghd=$(expand_user_path "$global_rec_hd")
+    fi
+    if [ -n "$check_ghd" ] && hook_has_wti "$check_ghd/post-checkout"; then
+        global_hook_active="yes"
+    fi
+
+    printf 'Global status:\n'
+    printf '  git alias:        %s\n' "${global_alias:-(not set)}"
+    printf '  installed script: %s (%s)\n' "$data_dir/git-worktreeinclude" "$( [ -f "$data_dir/git-worktreeinclude" ] && printf 'present' || printf 'absent' )"
+    printf '  core.hooksPath:   %s\n' "${global_hp:-(not set)}"
+    printf '  global hook:      %s\n' "$global_hook_active"
+
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
+        printf '\nRepository status:\n  (not inside a Git repository)\n'
+        return 0
+    fi
+
+    ensure_tmp || exit 1
+    printf '\nRepository status:\n'
+    cur_top=$(git -c core.quotePath=false rev-parse --show-toplevel 2>/dev/null || true)
+    main_wt=$(resolve_primary_worktree "." || true)
+    if [ -n "$cur_top" ] && [ -d "$cur_top" ]; then
+        cur_wt=$(canon_dir "$cur_top")
+        role="linked"
+        [ "$cur_wt" = "$main_wt" ] && role="primary"
+        printf '  current worktree: %s (%s)\n' "$cur_wt" "$role"
+    else
+        printf '  current worktree: (bare repository)\n'
+    fi
+    printf '  primary worktree: %s\n' "${main_wt:-(none)}"
+
+    local_hp=$(git config --local --get core.hooksPath 2>/dev/null || true)
+    local_hd=$(resolve_local_hooks_dir "." 2>/dev/null || true)
+    local_hook_active="no"
+    if [ -n "$local_hd" ] && hook_has_wti "$local_hd/post-checkout"; then
+        local_hook_active="yes"
+    fi
+
+    effective_active="no"
+    shadow_note=""
+    if [ -n "$local_hp" ]; then
+        if [ "$local_hook_active" = "yes" ]; then
+            effective_active="yes (local core.hooksPath: $local_hp)"
+        else
+            effective_active="no (shadowed by local core.hooksPath '$local_hp'; run 'git worktreeinclude install --local')"
+        fi
+    elif [ "$global_hook_active" = "yes" ]; then
+        effective_active="yes (global)"
+    elif [ -z "$global_hp" ] && [ "$local_hook_active" = "yes" ]; then
+        effective_active="yes (local)"
+    elif [ -n "$global_hp" ] && [ "$local_hook_active" = "yes" ]; then
+        effective_active="no (shadowed by global core.hooksPath '$global_hp')"
+    fi
+
+    printf '  local hook:       %s\n' "$local_hook_active"
+    printf '  effective hook:   %s%s\n' "$effective_active" "$shadow_note"
+
+    if [ -n "$main_wt" ]; then
+        wti_list="$WTI_TMP/status_wti_files"
+        discover_worktreeinclude_files "$main_wt" "$wti_list"
+        printf '  .worktreeinclude:\n'
+        if [ -s "$wti_list" ]; then
+            while IFS= read -r wf; do
+                [ -n "$wf" ] && printf '    - %s\n' "$wf"
+            done < "$wti_list"
+        else
+            printf '    (none found in primary worktree)\n'
+        fi
+    fi
+}
+
+print_help() {
+    cat <<'EOF'
+git-worktreeinclude — Automatically copy untracked/ignored files specified in
+.worktreeinclude from the primary worktree into newly created Git worktrees.
+
+Usage:
+  git worktreeinclude install [--local] [--hooks-dir <dir>]
+  git worktreeinclude uninstall [--local]
+  git worktreeinclude apply [<worktree-path>] [--all] [--dry-run|-n] [--verbose|-v]
+  git worktreeinclude status
+  git worktreeinclude --version | --help
+
+Commands:
+  install     Install the post-checkout worktree hook and 'git worktreeinclude' alias
+              (global by default; pass --local for current repository only).
+  uninstall   Cleanly remove the managed hook block and alias without disturbing
+              any existing user or repository Git hooks.
+  apply       Manually sync .worktreeinclude files from the primary worktree into the
+              current linked worktree, a target <worktree-path>, or --all worktrees.
+              Use --dry-run (-n) to preview matched paths (including from primary worktree).
+  status      Show global/local hook status, primary worktree, and discovered
+              .worktreeinclude files.
+
+Environment:
+  GIT_WORKTREEINCLUDE_VERBOSE=1   Log each copied/skipped path during hook or apply runs.
+EOF
+}
+
+# Restore caller working directory when invoked via a !-prefixed Git alias inside a subdirectory
+subcmd="${1:-}"
+if [ "$subcmd" != "_hook-post-checkout" ] && [ "${0##*/}" != "post-checkout" ]; then
+    if [ -n "${GIT_PREFIX:-}" ] && [ -d "$GIT_PREFIX" ]; then
+        cd "$GIT_PREFIX" || exit 1
+    fi
+fi
+
+# Support direct invocation as a post-checkout hook symlink/script
+if [ "${0##*/}" = "post-checkout" ]; then
+    cmd_hook_post_checkout "$@"
+fi
+
+case "${1:-help}" in
+    _hook-post-checkout)
+        shift
+        cmd_hook_post_checkout "$@"
+        ;;
+    install)
+        shift
+        cmd_install "$@"
+        ;;
+    uninstall)
+        shift
+        cmd_uninstall "$@"
+        ;;
+    apply)
+        shift
+        cmd_apply "$@"
+        ;;
+    status)
+        shift
+        cmd_status "$@"
+        ;;
+    help|-h|--help)
+        print_help
+        exit 0
+        ;;
+    version|-V|--version)
+        printf 'git-worktreeinclude %s\n' "$WTI_VERSION"
+        exit 0
+        ;;
+    *)
+        log_err "unknown command: $1 (see 'git worktreeinclude --help')"
+        exit 1
+        ;;
+esac

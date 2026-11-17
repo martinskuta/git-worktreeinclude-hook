@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    name: E2E (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run POSIX sh E2E test suite
+        shell: bash
+        run: |
+          sh ./tests/test_worktreeinclude.sh
+
+      - name: Verify strict /bin/sh (dash) compatibility on Linux
+        if: runner.os == 'Linux'
+        shell: sh
+        run: |
+          /bin/sh -n ./git-worktreeinclude
+          /bin/sh ./tests/test_worktreeinclude.sh
+
+      - name: Verify PowerShell 1-command installer & uninstall on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tmpHome = Join-Path ([System.IO.Path]::GetTempPath()) "wti-pwsh-$PID"
+          New-Item -ItemType Directory -Force -Path "$tmpHome\home", "$tmpHome\xdg" | Out-Null
+          $env:HOME = "$tmpHome\home"
+          $env:XDG_CONFIG_HOME = "$tmpHome\xdg"
+          $env:GIT_CONFIG_GLOBAL = "$tmpHome\home\.gitconfig"
+          $env:GIT_CONFIG_NOSYSTEM = "1"
+          try {
+            .\install.ps1
+            if ($LASTEXITCODE -ne 0) { throw "install.ps1 failed" }
+            $status = (& git worktreeinclude status) -join "`n"
+            if ($status -notmatch "global hook:\s+yes") {
+              throw "Unexpected status output:`n$status"
+            }
+            & git worktreeinclude uninstall
+            if ($LASTEXITCODE -ne 0) { throw "git worktreeinclude uninstall failed" }
+          } finally {
+            Remove-Item -Recurse -Force $tmpHome -ErrorAction SilentlyContinue
+          }
